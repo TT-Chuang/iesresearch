@@ -1,84 +1,24 @@
+import streamlit as st
+import pandas as pd
+from serpapi import GoogleSearch
 import io
 import re
-from datetime import datetime, timedelta
-from html.parser import HTMLParser
-from urllib.request import Request, urlopen
-
-import pandas as pd
-import streamlit as st
-from serpapi import GoogleSearch
 
 
-# --- Helpers ---
+# --- Helper: Parse dates ---
 
-class PageTitleParser(HTMLParser):
-    """Read a page's Open Graph, Twitter, or HTML title."""
-
-    def __init__(self):
-        super().__init__()
-        self.in_title = False
-        self.title_parts = []
-        self.meta_title = ""
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-
-        if tag.lower() == "meta":
-            property_name = (
-                attrs.get("property") or attrs.get("name") or ""
-            ).lower()
-
-            if property_name in {"og:title", "twitter:title"}:
-                self.meta_title = attrs.get("content", "").strip()
-
-        elif tag.lower() == "title":
-            self.in_title = True
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "title":
-            self.in_title = False
-
-    def handle_data(self, data):
-        if self.in_title:
-            self.title_parts.append(data)
-
-
-def get_full_page_title(url):
-    """Try to get a fuller title from the linked page."""
-    try:
-        request = Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-
-        with urlopen(request, timeout=5) as response:
-            html = response.read(1_000_000).decode(
-                response.headers.get_content_charset() or "utf-8",
-                errors="replace"
-            )
-
-        parser = PageTitleParser()
-        parser.feed(html)
-
-        if parser.meta_title:
-            return parser.meta_title
-
-        return " ".join(" ".join(parser.title_parts).split())
-
-    except Exception:
-        return ""
-
-
-def parse_result_date(value):
-    """Parse Google dates, including values such as '3 days ago'."""
-    if not value:
+def parse_date(value):
+    if value is None or pd.isna(value):
         return None
 
     text = str(value).strip()
 
+    if not text:
+        return None
+
+    # Handle relative dates returned by Google, such as "3 days ago"
     relative_match = re.search(
-        r"(\d+)\s+"
-        r"(minute|hour|day|week|month|year)s?\s+ago",
+        r"(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago",
         text,
         flags=re.IGNORECASE
     )
@@ -87,30 +27,22 @@ def parse_result_date(value):
         amount = int(relative_match.group(1))
         unit = relative_match.group(2).lower()
 
-        days_per_unit = {
-            "minute": 0,
-            "hour": 0,
-            "day": 1,
-            "week": 7,
-            "month": 30,
-            "year": 365,
-        }
-
-        hours_per_unit = {
-            "minute": 1 / 60,
-            "hour": 1,
-        }
-
-        if unit in hours_per_unit:
-            result_datetime = datetime.now() - timedelta(
-                hours=amount * hours_per_unit[unit]
-            )
+        if unit == "minute":
+            result = pd.Timestamp.now() - pd.Timedelta(minutes=amount)
+        elif unit == "hour":
+            result = pd.Timestamp.now() - pd.Timedelta(hours=amount)
         else:
-            result_datetime = datetime.now() - timedelta(
+            days_per_unit = {
+                "day": 1,
+                "week": 7,
+                "month": 30,
+                "year": 365
+            }
+            result = pd.Timestamp.now() - pd.Timedelta(
                 days=amount * days_per_unit[unit]
             )
 
-        return result_datetime.date()
+        return result.date()
 
     parsed = pd.to_datetime(text, errors="coerce")
 
@@ -120,7 +52,7 @@ def parse_result_date(value):
     return parsed.date()
 
 
-# --- UI Setup ---
+# --- UI Setup (English Interface) ---
 
 st.set_page_config(
     page_title="PR Media Discovery Tool",
@@ -130,13 +62,12 @@ st.set_page_config(
 st.title("🔍 PR Media Discovery Tool")
 
 st.markdown("""
-Upload a CSV with a **Title** column and a **Date** or **Published Date**
-column. The tool searches Google for coverage published after the original
-press release date.
+This tool searches Google for third-party media coverage published after
+the original press release date.
 """)
 
 
-# --- Sidebar: Settings ---
+# --- Sidebar: User Credentials ---
 
 with st.sidebar:
     st.header("Settings")
@@ -153,78 +84,59 @@ with st.sidebar:
             "youtube.com\n"
             "facebook.com\n"
             "linkedin.com\n"
-            "twitter.com\n"
-            "x.com"
+            "twitter.com"
         )
     )
 
-    exclude_list = [
-        domain.strip().lower()
-        for domain in exclude_domains.splitlines()
-        if domain.strip()
-    ]
-
-    st.caption("The search is limited to two Google results pages per title.")
+    exclude_list = exclude_domains.split("\n")
 
 
-# --- File Upload ---
+# --- Main Logic ---
 
 uploaded_file = st.file_uploader(
     "Upload your Input_PR_Titles.csv",
     type=["csv"]
 )
 
-
-# --- Main Logic ---
-
 if uploaded_file and api_key:
-    try:
-        df_input = pd.read_csv(uploaded_file)
-        df_input.columns = [
-            str(column).strip()
-            for column in df_input.columns
-        ]
+    # Read CSV
+    df_input = pd.read_csv(uploaded_file)
 
-    except Exception as e:
-        st.error(f"Unable to read CSV: {e}")
-        st.stop()
+    # Normalize column names
+    df_input.columns = [str(column).strip() for column in df_input.columns]
 
-    # Find the input date column, accepting either requested name.
-    date_columns = {
-        str(column).strip().lower(): column
-        for column in df_input.columns
-    }
-
-    input_date_column = (
-        date_columns.get("published date")
-        or date_columns.get("date")
+    # Accept either "Published Date" or "Date"
+    date_column = next(
+        (
+            column for column in df_input.columns
+            if column.lower() in ["published date", "date"]
+        ),
+        None
     )
 
     if "Title" not in df_input.columns:
-        st.error("CSV must contain a column named 'Title'.")
+        st.error("Error: CSV must contain a column named 'Title'")
 
-    elif input_date_column is None:
+    elif date_column is None:
         st.error(
-            "CSV must contain a date column named 'Date' "
-            "or 'Published Date'."
+            "Error: CSV must contain a 'Published Date' or 'Date' column"
         )
 
     else:
-        st.success(
-            f"CSV loaded successfully — {len(df_input)} rows found."
-        )
+        st.success("CSV Loaded Successfully!")
 
         if st.button("Start Discovery Process"):
+            results_storage = []
             search_items = []
             skipped_rows = 0
 
             for _, row in df_input.iterrows():
-                title = str(row.get("Title", "")).strip()
+                title = str(row["Title"]).strip()
 
                 if not title or title.lower() == "nan":
                     continue
 
-                original_date = parse_result_date(row[input_date_column])
+                original_date = parse_date(row[date_column])
 
                 if original_date is None:
                     skipped_rows += 1
@@ -235,17 +147,14 @@ if uploaded_file and api_key:
             if skipped_rows:
                 st.warning(
                     f"Skipped {skipped_rows} row(s) with a missing "
-                    "or unrecognized publication date."
+                    "or unreadable publication date."
                 )
 
             if not search_items:
-                st.warning(
-                    "No rows with a valid title and publication date were found."
+                st.info(
+                    "No rows with a valid title and publication date."
                 )
                 st.stop()
-
-            results_storage = []
-            seen_results = set()
 
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -256,135 +165,100 @@ if uploaded_file and api_key:
                     f"{title[:50]}..."
                 )
 
-                # Ask Google to prioritize results after the original date.
-                query = (
-                    f'"{title}" after:{original_date.isoformat()}'
-                )
+                # Newswise Formula: "Title "
+                query = f'"{title.strip()} "'
 
-                # Search up to two Google results pages.
-                for page in range(2):
-                    params = {
-                        "engine": "google",
-                        "q": query,
-                        "hl": "en",
-                        "filter": "0",
-                        "sort": "date",
-                        "num": 10,
-                        "start": page * 10,
-                        "api_key": api_key,
-                    }
+                params = {
+                    "engine": "google",
+                    "q": query,
+                    "hl": "en",
+                    "filter": "0",
+                    "sort": "date",
+                    "api_key": api_key
+                }
 
-                    try:
-                        response = GoogleSearch(params).get_dict()
-                        
-                        error_message = str(response.get("error") or "")
-                        
-                        # Google may return this message when a page has no more results.
-                        if "hasn't returned any results" in error_message.lower():
-                            break
-                        
-                        if error_message:
-                            st.warning(
-                                f"Search failed for '{title}' "
-                                f"(page {page + 1}): {error_message}"
-                            )
-                            continue
-                        
-                        organic_results = response.get("organic_results", [])
-                        
-                        # An empty result list is also a normal end to pagination.
-                        if not organic_results:
-                            break
+                try:
+                    search = GoogleSearch(params)
+                    response = search.get_dict()
 
-                        for result in organic_results:
-                            link = (result.get("link") or "").strip()
+                    error_message = str(response.get("error") or "")
 
-                            if not link:
-                                continue
-
-                            # Exclude specified domains.
-                            link_lower = link.lower()
-                            if any(
-                                domain in link_lower
-                                for domain in exclude_list
-                            ):
-                                continue
-
-                            # Require a result date later than the PR date.
-                            result_date = parse_result_date(
-                                result.get("date")
-                            )
-
-                            if result_date is None or result_date <= original_date:
-                                continue
-
-                            # Avoid duplicate URLs for the same PR title.
-                            result_key = (title.casefold(), link_lower)
-
-                            if result_key in seen_results:
-                                continue
-
-                            seen_results.add(result_key)
-
-                            google_title = (
-                                result.get("title") or ""
-                            ).strip()
-
-                            full_page_title = get_full_page_title(link)
-                            result_title = full_page_title or google_title
-
-                            results_storage.append({
-                                "Original Title": title,
-                                "Original Published Date": (
-                                    original_date.isoformat()
-                                ),
-                                "Media Outlet": (
-                                    result.get("source")
-                                    or result.get("displayed_link")
-                                    or ""
-                                ),
-                                "Result Title": result_title,
-                                "Result Published Date": (
-                                    result_date.isoformat()
-                                ),
-                                "URL": link,
-                            })
-
-                    except Exception as e:
+                    # No results for a query is a normal outcome.
+                    if (
+                        "hasn't returned any results"
+                        in error_message.lower()
+                    ):
+                        results = []
+                    elif error_message:
                         st.warning(
-                            f"Search failed for '{title}' "
-                            f"(page {page + 1}): {e}"
+                            f"Search failed for {title}: {error_message}"
+                        )
+                        results = []
+                    else:
+                        results = response.get("organic_results", [])
+
+                    for res in results:
+                        link = res.get("link", "")
+
+                        if not link:
+                            continue
+
+                        excluded = any(
+                            domain.strip().lower() in link.lower()
+                            for domain in exclude_list
+                            if domain.strip()
                         )
 
-                progress_bar.progress(
-                    (i + 1) / len(search_items)
-                )
+                        if excluded:
+                            continue
+
+                        result_date = parse_date(res.get("date"))
+
+                        # Include only results published after the original post.
+                        if result_date is None or result_date <= original_date:
+                            continue
+
+                        results_storage.append({
+                            "Original Title": title,
+                            "Original Published Date": (
+                                original_date.isoformat()
+                            ),
+                            "Media Outlet": res.get("source", ""),
+                            "Result Title": res.get("title", ""),
+                            "Result Published Date": (
+                                result_date.isoformat()
+                            ),
+                            "URL": link
+                        })
+
+                except Exception as e:
+                    st.warning(f"Search failed for {title}: {e}")
+
+                progress_bar.progress((i + 1) / len(search_items))
 
             status_text.empty()
 
-            output_columns = [
+            # --- Results Display & Download ---
+
+            columns = [
                 "Original Title",
                 "Original Published Date",
                 "Media Outlet",
                 "Result Title",
                 "Result Published Date",
-                "URL",
+                "URL"
             ]
 
-            df_results = pd.DataFrame(
-                results_storage,
-                columns=output_columns
-            )
-
-            if not df_results.empty:
-                st.subheader("Discovery Results")
-                st.write(f"Found **{len(df_results)} results**.")
-
-                st.dataframe(
-                    df_results,
-                    use_container_width=True
+            if results_storage:
+                df_results = pd.DataFrame(
+                    results_storage,
+                    columns=columns
                 )
 
+                st.subheader("Discovery Results")
+                st.dataframe(df_results)
+
+                # Convert to CSV for download
                 csv_buffer = io.StringIO()
                 df_results.to_csv(
                     csv_buffer,
@@ -401,9 +275,9 @@ if uploaded_file and api_key:
 
             else:
                 st.info(
-                    "No results with a Google-reported date later than "
-                    "the original press release date were found."
+                    "No third-party media results published after the "
+                    "original press release date were found."
                 )
 
-elif uploaded_file and not api_key:
+elif not api_key and uploaded_file:
     st.info("Please enter your SerpApi Key in the sidebar to begin.")
