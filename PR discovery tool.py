@@ -1,9 +1,43 @@
-import streamlit as st
-import pandas as pd
-from serpapi import GoogleSearch
 import io
+from urllib.parse import urlparse
+
+import pandas as pd
+import streamlit as st
+from serpapi import GoogleSearch
+
+
+# --- Helpers ---
+
+def normalize_domain(value):
+    """Normalize a domain or URL to a lowercase hostname."""
+    value = str(value).strip().lower()
+
+    if not value:
+        return ""
+
+    # Allow users to enter either a domain or a full URL.
+    if "://" not in value:
+        value = f"//{value}"
+
+    host = urlparse(value).hostname or ""
+    return host.lower().removeprefix("www.")
+
+
+def domain_matches(url, domains):
+    """Return True if the URL host matches a domain or its subdomain."""
+    host = normalize_domain(url)
+
+    if not host:
+        return False
+
+    return any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in domains
+    )
+
 
 # --- UI Setup ---
+
 st.set_page_config(
     page_title="PR Media Discovery Tool",
     layout="wide"
@@ -12,19 +46,15 @@ st.set_page_config(
 st.title("🔍 PR Media Discovery Tool")
 
 st.markdown("""
-This tool searches Google for third-party media coverage based on the exact title of each press release.
+Search Google News for coverage of each press release title.
 
-### Search Logic
-1. Search the exact PR title on Google.
-2. Prioritize Google's relevance ranking.
-3. Search multiple pages of Google results.
-4. Remove excluded domains.
-5. Remove duplicate URLs.
-6. Export the remaining results for review.
+Results are limited to two pages per title and included only when the
+result comes from an approved media outlet domain.
 """)
 
 
 # --- Sidebar: Settings ---
+
 with st.sidebar:
     st.header("Settings")
 
@@ -33,7 +63,21 @@ with st.sidebar:
         type="password"
     )
 
-    exclude_domains = st.text_area(
+    approved_domains_text = st.text_area(
+        "Approved media outlet domains (one per line)",
+        help=(
+            "Only results from these domains will be included. "
+            "Enter domains such as example.com."
+        )
+    )
+
+    approved_domains = {
+        normalize_domain(line)
+        for line in approved_domains_text.splitlines()
+        if normalize_domain(line)
+    }
+
+    exclude_domains_text = st.text_area(
         "Domains to Exclude (one per line)",
         value=(
             "newswise.com\n"
@@ -45,23 +89,17 @@ with st.sidebar:
         )
     )
 
-    exclude_list = [
-        domain.strip().lower()
-        for domain in exclude_domains.split("\n")
-        if domain.strip()
-    ]
+    exclude_domains = {
+        normalize_domain(line)
+        for line in exclude_domains_text.splitlines()
+        if normalize_domain(line)
+    }
 
-    pages_to_search = st.number_input(
-        "Google pages to search per title",
-        min_value=1,
-        max_value=10,
-        value=3,
-        step=1,
-        help="3 pages = approximately 30 Google results per title."
-    )
+    st.caption("The search is limited to two Google News pages per title.")
 
 
 # --- File Upload ---
+
 uploaded_file = st.file_uploader(
     "Upload your Input_PR_Titles.csv",
     type=["csv"]
@@ -69,268 +107,172 @@ uploaded_file = st.file_uploader(
 
 
 # --- Main Logic ---
-if uploaded_file and api_key:
 
+if uploaded_file:
     try:
         df_input = pd.read_csv(uploaded_file)
-
-        # Normalize column names
-        df_input.columns = [
-            str(c).strip()
-            for c in df_input.columns
-        ]
+        df_input.columns = [str(column).strip() for column in df_input.columns]
 
     except Exception as e:
         st.error(f"Unable to read CSV: {e}")
         st.stop()
 
-
     if "Title" not in df_input.columns:
-
-        st.error(
-            "Error: CSV must contain a column named 'Title'."
-        )
+        st.error("The CSV must contain a column named 'Title'.")
 
     else:
-
         st.success(
             f"CSV loaded successfully — {len(df_input)} rows found."
         )
 
-        if st.button("Start Discovery Process"):
+        if not api_key:
+            st.info("Enter your SerpApi Key in the sidebar to begin.")
 
-            results_storage = []
+        if not approved_domains:
+            st.info(
+                "Add at least one approved media outlet domain "
+                "in the sidebar to filter the results."
+            )
 
-            # Clean title list
+        start_search = st.button(
+            "Start Discovery Process",
+            disabled=not api_key or not approved_domains
+        )
+
+        if start_search:
+            # Clean titles: remove blanks and duplicate titles.
             titles = (
                 df_input["Title"]
                 .dropna()
                 .astype(str)
                 .str.strip()
             )
+            titles = titles[titles != ""].drop_duplicates().tolist()
 
-            # Remove blank titles
-            titles = titles[titles != ""]
-
-            # Remove duplicated titles
-            titles = titles.drop_duplicates().tolist()
-
-            if len(titles) == 0:
+            if not titles:
                 st.warning("No valid titles found.")
                 st.stop()
 
-            progress_bar = st.progress(0)
-
-            status_text = st.empty()
-
-            # Used for deduplication across search pages
+            results_storage = []
             seen_results = set()
 
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-            # ---------------------------------
-            # SEARCH EACH PRESS RELEASE TITLE
-            # ---------------------------------
-
-            for i, title in enumerate(titles):
-
+            # Search each title on up to two Google News pages.
+            for title_index, title in enumerate(titles):
                 status_text.text(
-                    f"Searching ({i + 1}/{len(titles)}): "
+                    f"Searching ({title_index + 1}/{len(titles)}): "
                     f"{title[:80]}"
                 )
 
-                # Exact phrase search
                 query = f'"{title}"'
 
-
-                # Search multiple Google result pages
-                for page in range(int(pages_to_search)):
-
-                    start_position = page * 10
-
+                for page in range(2):
                     params = {
                         "engine": "google",
+                        "tbm": "nws",
                         "q": query,
                         "hl": "en",
-
-                        # Do not force date sorting.
-                        # Let Google rank by relevance.
-                        "filter": "0",
-
-                        "num": 10,
-                        "start": start_position,
-
-                        "api_key": api_key
+                        "start": page * 10,
+                        "api_key": api_key,
                     }
 
-
                     try:
+                        response = GoogleSearch(params).get_dict()
 
-                        search = GoogleSearch(params)
+                        if response.get("error"):
+                            st.warning(
+                                f"Search failed for '{title}' "
+                                f"(page {page + 1}): "
+                                f"{response['error']}"
+                            )
+                            continue
 
-                        response = search.get_dict()
+                        news_results = response.get("news_results", [])
 
-                        organic_results = response.get(
-                            "organic_results",
-                            []
-                        )
-
-
-                        # If Google returns no more results,
-                        # stop searching additional pages.
-                        if not organic_results:
+                        if not news_results:
                             break
 
-
-                        for result in organic_results:
-
-                            link = result.get(
-                                "link",
-                                ""
+                        for result in news_results:
+                            link = (result.get("link") or "").strip()
+                            outlet = (result.get("source") or "").strip()
+                            result_title = (
+                                result.get("title") or ""
                             ).strip()
 
-                            if not link:
+                            # Require a URL, publisher name, and approved domain.
+                            if not link or not outlet:
                                 continue
 
-
-                            # -----------------------------
-                            # DOMAIN EXCLUSION
-                            # -----------------------------
-
-                            link_lower = link.lower()
-
-                            excluded = any(
-                                domain in link_lower
-                                for domain in exclude_list
-                            )
-
-                            if excluded:
+                            if not domain_matches(link, approved_domains):
                                 continue
 
+                            if domain_matches(link, exclude_domains):
+                                continue
 
-                            # -----------------------------
-                            # DEDUPLICATION
-                            # -----------------------------
-
-                            # Keep duplicate URLs from
-                            # appearing more than once
-                            # for the same PR title.
-                            result_key = (
-                                title.lower(),
-                                link_lower
-                            )
+                            # Avoid duplicate URLs for the same PR title.
+                            result_key = (title.casefold(), link)
 
                             if result_key in seen_results:
                                 continue
 
                             seen_results.add(result_key)
 
-
-                            # -----------------------------
-                            # SAVE RESULT
-                            # -----------------------------
-
                             results_storage.append({
-                                "Original_Title": title,
-
-                                "Media_Outlet": (
-                                    result.get("source")
-                                    or result.get("displayed_link")
-                                    or ""
-                                ),
-
-                                "Search_Result_Title": (
-                                    result.get("title", "")
-                                ),
-
-                                "Evidence_Link": link,
-
-                                "Snippet": (
-                                    result.get("snippet", "")
-                                ),
-
-                                "Google_Position": (
-                                    result.get("position", "")
-                                ),
-
-                                "Google_Page": page + 1
+                                "Original Title": title,
+                                "Media Outlet": outlet,
+                                "Result Title": result_title,
+                                "URL": link,
                             })
 
-
                     except Exception as e:
-
                         st.warning(
                             f"Search failed for '{title}' "
                             f"(page {page + 1}): {e}"
                         )
 
-
-                # Update progress
                 progress_bar.progress(
-                    (i + 1) / len(titles)
+                    (title_index + 1) / len(titles)
                 )
-
-
-            # ---------------------------------
-            # RESULTS
-            # ---------------------------------
 
             status_text.empty()
 
-            if results_storage:
+            # Keep the requested column order, including for an empty result set.
+            columns = [
+                "Original Title",
+                "Media Outlet",
+                "Result Title",
+                "URL",
+            ]
+            df_results = pd.DataFrame(results_storage, columns=columns)
 
-                df_results = pd.DataFrame(
-                    results_storage
-                )
+            st.subheader("Discovery Results")
+            st.write(
+                f"Found **{len(df_results)} results** "
+                f"across **{len(titles)} unique PR titles**."
+            )
 
-                st.subheader("Discovery Results")
-
-                st.write(
-                    f"Found **{len(df_results)} results** "
-                    f"across **{len(titles)} PR titles**."
-                )
-
+            if not df_results.empty:
                 st.dataframe(
                     df_results,
                     use_container_width=True
                 )
 
-
-                # ---------------------------------
-                # CSV DOWNLOAD
-                # ---------------------------------
-
                 csv_buffer = io.StringIO()
-
                 df_results.to_csv(
                     csv_buffer,
-                    index=False,
-                    encoding="utf-8-sig"
+                    index=False
                 )
 
                 st.download_button(
                     label="📥 Download Media_Coverage_Report.csv",
-
                     data=csv_buffer.getvalue(),
-
-                    file_name=(
-                        "Media_Coverage_Report.csv"
-                    ),
-
+                    file_name="Media_Coverage_Report.csv",
                     mime="text/csv"
                 )
-
-
             else:
-
                 st.info(
-                    "No third-party media results were found "
-                    "based on the current search and exclusion filters."
+                    "No results matched the approved media outlet domains "
+                    "and exclusion filters."
                 )
-
-
-elif uploaded_file and not api_key:
-
-    st.info(
-        "Please enter your SerpApi Key "
-        "in the sidebar to begin."
-    )
