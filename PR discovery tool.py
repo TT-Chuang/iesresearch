@@ -276,19 +276,23 @@ if uploaded_file and api_key:
 
                     try:
                         response = GoogleSearch(params).get_dict()
-
-                        if response.get("error"):
+                        
+                        error_message = str(response.get("error") or "")
+                        
+                        # Google may return this message when a page has no more results.
+                        if "hasn't returned any results" in error_message.lower():
+                            break
+                        
+                        if error_message:
                             st.warning(
                                 f"Search failed for '{title}' "
-                                f"(page {page + 1}): {response['error']}"
+                                f"(page {page + 1}): {error_message}"
                             )
                             continue
-
-                        organic_results = response.get(
-                            "organic_results",
-                            []
-                        )
-
+                        
+                        organic_results = response.get("organic_results", [])
+                        
+                        # An empty result list is also a normal end to pagination.
                         if not organic_results:
                             break
 
