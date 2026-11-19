@@ -31,22 +31,43 @@ RELATIVE_UNITS = {
 }
 GOOGLE_HOST = re.compile(r"(?:www\.)?google\.(?:com|[a-z]{2}|(?:com|co)\.[a-z]{2})")
 TRUNCATED_TITLE = re.compile(r"(?:\.{3}|…)\s*$")
+PAGE_PLACEHOLDERS = {"access denied", "just a moment", "please wait", "verify you are human"}
 
 
 def publisher_url(result):
+    goto_links = []
     for field in ("link", "redirect_link"):
         value = (result.get(field) or "").strip()
         try:
             parsed = urlsplit(value)
-            if parsed.path == "/url" and (
-                not parsed.netloc or GOOGLE_HOST.fullmatch(parsed.hostname or "")
-            ):
+            is_google = not parsed.netloc or GOOGLE_HOST.fullmatch(parsed.hostname or "")
+            if is_google and parsed.path in ("/url", "/goto"):
                 query = parse_qs(parsed.query)
-                value = (query.get("url") or query.get("q") or [""])[0]
+                target = (query.get("url") or query.get("q") or [""])[0]
+                if parsed.path == "/goto" and not target.startswith(("http://", "https://")):
+                    if not parsed.netloc:
+                        value = f"https://www.google.com{value}"
+                    if value not in goto_links:
+                        goto_links.append(value)
+                value = target
                 parsed = urlsplit(value)
             if parsed.scheme in ("http", "https") and parsed.hostname:
-                return value
+                if not (GOOGLE_HOST.fullmatch(parsed.hostname) and parsed.path in ("/url", "/goto")):
+                    return value
         except ValueError:
+            continue
+
+    for link in goto_links:
+        try:
+            with requests.get(link, timeout=(3, 5), stream=True) as page:
+                destination = urlsplit(page.url)
+                if (
+                    destination.scheme in ("http", "https")
+                    and destination.hostname
+                    and not GOOGLE_HOST.fullmatch(destination.hostname)
+                ):
+                    return page.url
+        except (requests.RequestException, ValueError):
             continue
     return ""
 
@@ -109,7 +130,11 @@ def full_headline(google_title, url):
         "".join(parser.title_parts),
     ):
         headline = " ".join(candidate.split())
-        if headline and not TRUNCATED_TITLE.search(headline):
+        if (
+            headline
+            and headline.lower().rstrip(".!…") not in PAGE_PLACEHOLDERS
+            and not TRUNCATED_TITLE.search(headline)
+        ):
             return headline
     return google_title
 
@@ -166,7 +191,7 @@ def search_release(title, release_date, api_key):
             "Original Published Date": release_date.isoformat() if release_date else "",
             "Media Outlet": result.get("source") or urlsplit(url).hostname or "",
             "Result Title": full_headline(result.get("title") or "", url),
-            "Result Published Date": displayed_date,
+            "Result Published Date": result_date.isoformat() if result_date else displayed_date,
             "URL": url,
         })
 
