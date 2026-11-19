@@ -94,3 +94,70 @@ def main():
     api_key = st.sidebar.text_input("SerpApi key", type="password").strip()
     uploaded_file = st.file_uploader(
         "Upload a CSV with Title and Published Date (or Date)", type=["csv"]
+    )
+    if uploaded_file is None:
+        st.session_state.pop("pickup_report", None)
+        return
+
+    file_bytes = uploaded_file.getvalue()
+    try:
+        csv_text = file_bytes.decode("utf-8-sig")
+        reader = csv.DictReader(csv_text.splitlines(keepends=True))
+        columns = {name.strip().lower(): name for name in reader.fieldnames or []}
+        title_column = columns.get("title")
+        date_column = columns.get("published date") or columns.get("date")
+        if title_column is None or date_column is None:
+            st.error("The CSV needs a Title column and a Published Date or Date column.")
+            return
+        releases = [
+            (row[title_column].strip(), row.get(date_column))
+            for row in reader
+            if row.get(title_column) and row[title_column].strip()
+        ]
+    except (UnicodeError, csv.Error):
+        st.error("Upload a valid UTF-8 CSV.")
+        return
+
+    if not releases:
+        st.info("The CSV has no press release titles.")
+        return
+
+    if st.button("Find media pickup", disabled=not api_key):
+        rows = []
+        warnings = []
+        progress = st.progress(0)
+        for index, (title, date_text) in enumerate(releases, start=1):
+            release_date = parse_calendar_date(date_text)
+            if release_date is None:
+                warnings.append(f"Missing or invalid release date for {title}. All results were kept.")
+            try:
+                rows.extend(search_release(title, release_date, api_key))
+            except Exception:
+                warnings.append(f"Google search failed for {title} (search {index}).")
+            progress.progress(index / len(releases))
+        progress.empty()
+        st.session_state["pickup_report"] = (file_bytes, rows, warnings)
+
+    report = st.session_state.get("pickup_report")
+    if report is None or report[0] != file_bytes:
+        return
+
+    _, rows, warnings = report
+    for message in warnings:
+        st.warning(message)
+    if not rows:
+        st.info("No media results to display.")
+        return
+
+    results = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+    st.dataframe(results, hide_index=True)
+    st.download_button(
+        "Download media coverage CSV",
+        data=results.to_csv(index=False).encode("utf-8-sig"),
+        file_name="Media_Coverage_Report.csv",
+        mime="text/csv",
+    )
+
+
+if __name__ == "__main__":
+    main()
