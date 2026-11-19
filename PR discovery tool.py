@@ -1,9 +1,11 @@
 import csv
 import re
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urlsplit
 
 import pandas as pd
+import requests
 import streamlit as st
 from serpapi import GoogleSearch
 
@@ -27,6 +29,89 @@ RELATIVE_UNITS = {
     "day": "days",
     "week": "weeks",
 }
+GOOGLE_HOST = re.compile(r"(?:www\.)?google\.(?:com|[a-z]{2}|(?:com|co)\.[a-z]{2})")
+TRUNCATED_TITLE = re.compile(r"(?:\.{3}|…)\s*$")
+
+
+def publisher_url(result):
+    for field in ("link", "redirect_link"):
+        value = (result.get(field) or "").strip()
+        try:
+            parsed = urlsplit(value)
+            if parsed.path == "/url" and (
+                not parsed.netloc or GOOGLE_HOST.fullmatch(parsed.hostname or "")
+            ):
+                query = parse_qs(parsed.query)
+                value = (query.get("url") or query.get("q") or [""])[0]
+                parsed = urlsplit(value)
+            if parsed.scheme in ("http", "https") and parsed.hostname:
+                return value
+        except ValueError:
+            continue
+    return ""
+
+
+class PageTitleParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.metadata = {}
+        self.title_parts = []
+        self.in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "title":
+            self.in_title = True
+        if tag == "meta":
+            attributes = dict(attrs)
+            name = attributes.get("property") or attributes.get("name")
+            content = attributes.get("content")
+            if name in ("og:title", "twitter:title") and content:
+                self.metadata.setdefault(name, content)
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self.in_title = False
+
+    def handle_data(self, text):
+        if self.in_title:
+            self.title_parts.append(text)
+
+
+def full_headline(google_title, url):
+    if not url or (
+        google_title
+        and not TRUNCATED_TITLE.search(google_title)
+        and not google_title.startswith(("https://", "http://"))
+    ):
+        return google_title
+
+    try:
+        with requests.get(url, timeout=(3, 5), stream=True) as page:
+            page.raise_for_status()
+            if "html" not in page.headers.get("Content-Type", "").lower():
+                return google_title
+            head = bytearray()
+            for chunk in page.iter_content(chunk_size=8192):
+                head.extend(chunk)
+                if b"</head" in head.lower() or len(head) >= 256 * 1024:
+                    break
+            parser = PageTitleParser()
+            encoding = page.encoding
+            if not encoding or encoding.lower() == "iso-8859-1":
+                encoding = "utf-8"
+            parser.feed(head.decode(encoding, errors="replace"))
+    except (requests.RequestException, LookupError):
+        return google_title
+
+    for candidate in (
+        parser.metadata.get("og:title", ""),
+        parser.metadata.get("twitter:title", ""),
+        "".join(parser.title_parts),
+    ):
+        headline = " ".join(candidate.split())
+        if headline and not TRUNCATED_TITLE.search(headline):
+            return headline
+    return google_title
 
 
 def parse_calendar_date(value):
@@ -75,12 +160,12 @@ def search_release(title, release_date, api_key):
         if release_date and result_date and result_date < release_date:
             continue
 
-        url = result.get("link") or ""
+        url = publisher_url(result)
         rows.append({
             "Original Title": title,
             "Original Published Date": release_date.isoformat() if release_date else "",
             "Media Outlet": result.get("source") or urlsplit(url).hostname or "",
-            "Result Title": result.get("title") or "",
+            "Result Title": full_headline(result.get("title") or "", url),
             "Result Published Date": displayed_date,
             "URL": url,
         })
